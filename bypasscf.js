@@ -57,8 +57,11 @@ if (fs.existsSync(".env.local")) {
   );
 }
 
+// 导航超时常量（提取避免重复）
+const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10);
+
 // 读取以分钟为单位的运行时间限制
-const runTimeLimitMinutes = process.env.RUN_TIME_LIMIT_MINUTES || 20;
+const runTimeLimitMinutes = process.env.RUN_TIME_LIMIT_MINUTES || 15;
 
 // 将分钟转换为毫秒
 const runTimeLimitMillis = runTimeLimitMinutes * 60 * 1000;
@@ -90,12 +93,20 @@ const isAutoLike = process.env.AUTO_LIKE !== "false"; // 默认开启，只有�
 const enableRssFetch = process.env.ENABLE_RSS_FETCH === "true"; // 是否开启抓取RSS，只有明确设置为"true"才开启，默认为false
 const enableTopicDataFetch = process.env.ENABLE_TOPIC_DATA_FETCH === "true"; // 是否开启抓取话题数据，只有明确设置为"true"才开启，默认为false
 
+// 隐蔽模式配额配置
+const stealthConfig = {
+  dailyTopicLimit: process.env.DAILY_TOPIC_LIMIT || "8",
+  dailyLikeLimit: process.env.DAILY_LIKE_LIMIT || "1",
+  minReadTime: String((parseInt(process.env.MIN_READ_TIME_SECONDS || "30", 10)) * 1000),
+  maxReadTime: String((parseInt(process.env.MAX_READ_TIME_SECONDS || "240", 10)) * 1000),
+};
+console.log(`[stealth] 配额配置: 话题=${stealthConfig.dailyTopicLimit}/天, 点赞=${stealthConfig.dailyLikeLimit}/天, 阅读时间=${stealthConfig.minReadTime}~${stealthConfig.maxReadTime}ms`);
+
 console.log(
   `RSS抓取功能状态: ${enableRssFetch ? "开启" : "关闭"} (环境变量值: "${process.env.ENABLE_RSS_FETCH || ''}")，勿设置`
 );
 console.log(
-  `话题数据抓取功能状态: ${
-    enableTopicDataFetch ? "开启" : "关闭"
+  `话题数据抓取功能状态: ${enableTopicDataFetch ? "开启" : "关闭"
   } (环境变量值: "${process.env.ENABLE_TOPIC_DATA_FETCH || ''}")，勿设置`
 );
 
@@ -137,8 +148,7 @@ async function tgSendWithRetry(id, message, maxRetries = 3) {
       lastErr = e;
       const delay = 1500 * (i + 1);
       console.error(
-        `Telegram send failed (attempt ${i + 1}/${maxRetries}): ${
-          e && e.message ? e.message : e
+        `Telegram send failed (attempt ${i + 1}/${maxRetries}): ${e && e.message ? e.message : e
         }`
       );
       await new Promise((r) => setTimeout(r, delay));
@@ -251,8 +261,7 @@ function delayClick(time) {
         console.log("没有下一个批次，即将结束");
       }
       console.log(
-        `批次 ${
-          Math.floor(i / maxConcurrentAccounts) + 1
+        `批次 ${Math.floor(i / maxConcurrentAccounts) + 1
         } 完成，关闭浏览器...,浏览器对象：${browsers}`
       );
       // 关闭所有浏览器实例
@@ -359,8 +368,7 @@ async function launchBrowserForUser(username, password) {
             }
           } catch (e2) {
             console.warn(
-              `Skip disabling autoLike due to closed target: ${
-                (e2 && e2.message) ? e2.message : e2
+              `Skip disabling autoLike due to closed target: ${(e2 && e2.message) ? e2.message : e2
               }`
             );
           }
@@ -387,8 +395,8 @@ async function launchBrowserForUser(username, password) {
 
     //真正执行阅读脚本
     let externalScriptPath;
-    if (isLikeSpecificUser === "true") {
-      const randomChoice = Math.random() < 0.5; // 生成一个随机数，50% 概率为 true
+    if (isLikeSpecificUser) {
+      const randomChoice = Math.random() < 0.5;
       if (randomChoice) {
         externalScriptPath = path.join(
           dirname(fileURLToPath(import.meta.url)),
@@ -410,58 +418,57 @@ async function launchBrowserForUser(username, password) {
     }
     const externalScript = fs.readFileSync(externalScriptPath, "utf8");
 
-    // 在每个新的文档加载时执行外部脚本
+    // 在每个新的文档加载时执行外部脚本，同时注入隐蔽配额
     await page.evaluateOnNewDocument(
       (...args) => {
-        const [specificUser, scriptToEval, isAutoLike] = args;
+        const [specificUser, scriptToEval, isAutoLike, stealthCfg] = args;
         localStorage.setItem("read", true);
         localStorage.setItem("specificUser", specificUser);
         localStorage.setItem("isFirstRun", "false");
         localStorage.setItem("autoLikeEnabled", isAutoLike);
-        console.log("当前点赞用户：", specificUser);
+        // 注入隐蔽模式配额
+        localStorage.setItem("stealthDailyTopicLimit", stealthCfg.dailyTopicLimit);
+        localStorage.setItem("stealthDailyLikeLimit", stealthCfg.dailyLikeLimit);
+        localStorage.setItem("stealthMinReadTime", stealthCfg.minReadTime);
+        localStorage.setItem("stealthMaxReadTime", stealthCfg.maxReadTime);
+        console.log("[stealth] 配额已注入, 点赞用户:", specificUser);
         eval(scriptToEval);
       },
       specificUser,
       externalScript,
-      isAutoLike
-    ); //变量必须从外部显示的传入, 因为在浏览器上下文它是读取不了的
+      isAutoLike,
+      stealthConfig
+    );
     // 添加一个监听器来监听每次页面加载完成的事件
     page.on("load", async () => {
       // await page.evaluate(externalScript); //因为这个是在页面加载好之后执行的,而脚本是在页面加载好时刻来判断是否要执行，由于已经加载好了，脚本就不会起作用
     });
-    // 如果是Linuxdo，就导航到我的帖子，但我感觉这里写没什么用，因为外部脚本已经定义好了，不对，这里不会点击按钮，所以不会跳转，需要手动跳转
-    if (loginUrl == "https://linux.do") {
-      await page.goto("https://linux.do/t/topic/13716/790", {
-        waitUntil: "domcontentloaded",
-        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
-      });
-    } else if (loginUrl == "https://meta.appinn.net") {
-      await page.goto("https://meta.appinn.net/t/topic/52006", {
-        waitUntil: "domcontentloaded",
-        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
-      });
-    } else {
-      await page.goto(`${loginUrl}/t/topic/1`, {
-        waitUntil: "domcontentloaded",
-        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
-      });
-    }
+    // 导航到最新页面（不再硬编码固定话题 ID，由注入脚本选择话题）
+    await page.goto(`${loginUrl}/latest`, {
+      waitUntil: "domcontentloaded",
+      timeout: NAV_TIMEOUT,
+    });
     // Ensure automation injected after navigation (fallback in case init-script failed)
     try {
       await page.evaluate(
-        (specificUser, scriptToEval, isAutoLike) => {
+        (specificUser, scriptToEval, isAutoLike, stealthCfg) => {
           if (!window.__autoInjected) {
             localStorage.setItem("read", true);
             localStorage.setItem("specificUser", specificUser);
             localStorage.setItem("isFirstRun", "false");
             localStorage.setItem("autoLikeEnabled", isAutoLike);
+            localStorage.setItem("stealthDailyTopicLimit", stealthCfg.dailyTopicLimit);
+            localStorage.setItem("stealthDailyLikeLimit", stealthCfg.dailyLikeLimit);
+            localStorage.setItem("stealthMinReadTime", stealthCfg.minReadTime);
+            localStorage.setItem("stealthMaxReadTime", stealthCfg.maxReadTime);
             try { eval(scriptToEval); } catch (e) { console.error("eval external script failed", e); }
             window.__autoInjected = true;
           }
         },
         specificUser,
         externalScript,
-        isAutoLike
+        isAutoLike,
+        stealthConfig
       );
     } catch (e) {
       console.warn(`Post-navigation inject failed: ${e && e.message ? e.message : e}`);
@@ -556,13 +563,13 @@ async function login(page, username, password, retryCount = 3) {
     if (loginUrl == "https://meta.appinn.net") {
       await page.goto("https://meta.appinn.net/t/topic/52006", {
         waitUntil: "domcontentloaded",
-        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
+        timeout: NAV_TIMEOUT,
       });
       await page.click(".discourse-reactions-reaction-button");
     } else {
       await page.goto(`${loginUrl}/t/topic/1`, {
         waitUntil: "domcontentloaded",
-        timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10),
+        timeout: NAV_TIMEOUT,
       });
       try {
         await page.click(".discourse-reactions-reaction-button");
@@ -623,7 +630,7 @@ async function login(page, username, password, retryCount = 3) {
     } else {
       if (retryCount > 0) {
         console.log("Retrying login...");
-        await page.reload({ waitUntil: "domcontentloaded", timeout: parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10) });
+        await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
         await delayClick(2000); // 增加重试前的延迟
         return await login(page, username, password, retryCount - 1);
       } else {
@@ -639,10 +646,8 @@ async function login(page, username, password, retryCount = 3) {
 
 async function navigatePage(url, page, browser) {
   try {
-    page.setDefaultNavigationTimeout(
-      parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10)
-    );
-  } catch {}
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+  } catch { }
   await page.goto(url, { waitUntil: "domcontentloaded" }); //如果使用默认的load,linux下页面会一直加载导致无法继续执行
 
   const startTime = Date.now(); // 记录开始时间

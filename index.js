@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         Auto Read
+// @name         Auto Read (Stealth)
 // @namespace    http://tampermonkey.net/
-// @version      1.4.6
-// @description  自动刷linuxdo文章
+// @version      2.0.0
+// @description  自动刷linuxdo文章（隐蔽模式）
 // @author       liuweiqing
 // @match        https://meta.discourse.org/*
 // @match        https://linux.do/*
 // @match        https://meta.appinn.net/*
-// @match        https://community.openai.com/
+// @match        https://community.openai.com/*
 // @match        https://idcflare.com/*
 // @exclude      https://linux.do/a/9611/0
 // @grant        none
@@ -18,271 +18,438 @@
 // ==/UserScript==
 
 (function () {
-  ("use strict");
-  // 定义可能的基本URL
+  "use strict";
+
+  // ============= 配置项 =============
+  const CONFIG = {
+    // 每日配额（通过 localStorage 可被 bypasscf.js 覆盖）
+    dailyTopicLimit: parseInt(localStorage.getItem("stealthDailyTopicLimit") || "8", 10),
+    dailyLikeLimit: parseInt(localStorage.getItem("stealthDailyLikeLimit") || "1", 10),
+
+    // 阅读时间范围（毫秒）
+    minReadTime: parseInt(localStorage.getItem("stealthMinReadTime") || "30000", 10),   // 30秒
+    maxReadTime: parseInt(localStorage.getItem("stealthMaxReadTime") || "240000", 10),  // 4分钟
+
+    // 滚动参数
+    scrollSpeedMin: 12,      // 最慢 px/step
+    scrollSpeedMax: 45,      // 最快 px/step
+    scrollIntervalMin: 30,   // 最快间隔 ms
+    scrollIntervalMax: 130,  // 最慢间隔 ms
+
+    // 阅读暂停
+    pauseChancePerCheck: 0.03,   // 每次滚动检查时 3% 概率暂停
+    pauseDurationMin: 1500,      // 暂停 1.5~6 秒
+    pauseDurationMax: 6000,
+    backScrollChance: 0.02,      // 2% 概率向上回翻
+    backScrollMin: 50,
+    backScrollMax: 200,
+
+    // 点赞概率
+    likeChance: 0.08,  // 8% 概率
+    likeMinScrollRatio: 0.5,  // 至少滚动 50% 才考虑点赞
+
+    // 话题间等待
+    topicGapMin: 3000,   // 3~10 秒
+    topicGapMax: 10000,
+
+    // 话题列表每次只取 1 页
+    topicListPageSize: 30,
+  };
+
+  // ============= 基础 URL 检测 =============
   const possibleBaseURLs = [
     "https://linux.do",
     "https://meta.discourse.org",
     "https://meta.appinn.net",
     "https://community.openai.com",
-    "https://idcflare.com/",
+    "https://idcflare.com",
   ];
-  const commentLimit = 1000;
-  const topicListLimit = 100;
-  const likeLimit = 50;
-  // 获取当前页面的URL
-  const currentURL = window.location.href;
 
-  // 确定当前页面对应的BASE_URL
+  const currentURL = window.location.href;
   let BASE_URL = possibleBaseURLs.find((url) => currentURL.startsWith(url));
-  console.log("currentURL:", currentURL);
-  // 环境变量：阅读网址，如果没有找到匹配的URL，则默认为第一个
   if (!BASE_URL) {
     BASE_URL = possibleBaseURLs[0];
-    console.log("默认BASE_URL设置为: " + BASE_URL);
-  } else {
-    console.log("当前BASE_URL是: " + BASE_URL);
   }
 
-  console.log("脚本正在运行在: " + BASE_URL);
-  //1.进入网页 https://linux.do/t/topic/数字（1，2，3，4）
-  //2.使滚轮均衡的往下移动模拟刷文章
-  // 检查是否是第一次运行脚本
+  // ============= 工具函数 =============
+
+  // 高斯随机数（Box-Muller），让行为更自然
+  function gaussianRandom(mean, stdDev) {
+    let u1 = Math.random();
+    let u2 = Math.random();
+    let z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+    return Math.max(0, mean + z * stdDev);
+  }
+
+  // 范围内随机整数
+  function randInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  // 范围内随机浮点
+  function randFloat(min, max) {
+    return Math.random() * (max - min) + min;
+  }
+
+  // 异步延迟
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // 获取今天的日期 key (YYYY-MM-DD)
+  function getTodayKey() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  // ============= 每日配额管理 =============
+
+  function getDailyStats() {
+    const dateKey = localStorage.getItem("stealth_dateKey");
+    const today = getTodayKey();
+
+    if (dateKey !== today) {
+      // 新的一天，重置计数
+      localStorage.setItem("stealth_dateKey", today);
+      localStorage.setItem("stealth_topicsToday", "0");
+      localStorage.setItem("stealth_likesToday", "0");
+      return { topicsToday: 0, likesToday: 0 };
+    }
+
+    return {
+      topicsToday: parseInt(localStorage.getItem("stealth_topicsToday") || "0", 10),
+      likesToday: parseInt(localStorage.getItem("stealth_likesToday") || "0", 10),
+    };
+  }
+
+  function incrementTopicCount() {
+    const stats = getDailyStats();
+    const newCount = stats.topicsToday + 1;
+    localStorage.setItem("stealth_topicsToday", String(newCount));
+    console.log(`[stealth] 今日已阅读话题: ${newCount}/${CONFIG.dailyTopicLimit}`);
+    return newCount;
+  }
+
+  function incrementLikeCount() {
+    const stats = getDailyStats();
+    const newCount = stats.likesToday + 1;
+    localStorage.setItem("stealth_likesToday", String(newCount));
+    console.log(`[stealth] 今日已点赞: ${newCount}/${CONFIG.dailyLikeLimit}`);
+    return newCount;
+  }
+
+  function hasReachedTopicLimit() {
+    const stats = getDailyStats();
+    return stats.topicsToday >= CONFIG.dailyTopicLimit;
+  }
+
+  function hasReachedLikeLimit() {
+    const stats = getDailyStats();
+    return stats.likesToday >= CONFIG.dailyLikeLimit;
+  }
+
+  // ============= 人类模拟滚动 =============
+
+  let scrollTimer = null;
+  let readingTimer = null;
+  let isPaused = false;
+  let totalPageHeight = 0;
+  let scrollStartY = 0;
+
+  function getScrollProgress() {
+    const scrolled = window.scrollY - scrollStartY;
+    const scrollable = document.body.scrollHeight - window.innerHeight;
+    return scrollable > 0 ? scrolled / scrollable : 1;
+  }
+
+  function isNearBottom() {
+    return window.innerHeight + window.scrollY >= document.body.offsetHeight - 150;
+  }
+
+  function startHumanScroll() {
+    if (scrollTimer !== null) {
+      clearTimeout(scrollTimer);
+    }
+    scrollStartY = window.scrollY;
+    totalPageHeight = document.body.scrollHeight;
+    scheduleNextScroll();
+  }
+
+  function scheduleNextScroll() {
+    if (localStorage.getItem("read") !== "true") return;
+
+    // 计算随机的间隔和距离（高斯分布让大部分值集中在中间）
+    const stepSize = Math.round(gaussianRandom(
+      (CONFIG.scrollSpeedMin + CONFIG.scrollSpeedMax) / 2,
+      (CONFIG.scrollSpeedMax - CONFIG.scrollSpeedMin) / 4
+    ));
+    const interval = Math.round(gaussianRandom(
+      (CONFIG.scrollIntervalMin + CONFIG.scrollIntervalMax) / 2,
+      (CONFIG.scrollIntervalMax - CONFIG.scrollIntervalMin) / 4
+    ));
+
+    const clampedStep = Math.max(CONFIG.scrollSpeedMin, Math.min(CONFIG.scrollSpeedMax, stepSize));
+    const clampedInterval = Math.max(CONFIG.scrollIntervalMin, Math.min(CONFIG.scrollIntervalMax, interval));
+
+    scrollTimer = setTimeout(() => {
+      if (localStorage.getItem("read") !== "true") return;
+
+      // 偶尔暂停（模拟阅读）
+      if (!isPaused && Math.random() < CONFIG.pauseChancePerCheck) {
+        isPaused = true;
+        const pauseDuration = randInt(CONFIG.pauseDurationMin, CONFIG.pauseDurationMax);
+        console.log(`[stealth] 阅读暂停 ${(pauseDuration / 1000).toFixed(1)}s`);
+        setTimeout(() => {
+          isPaused = false;
+          scheduleNextScroll();
+        }, pauseDuration);
+        return;
+      }
+
+      // 偶尔向上回翻
+      if (Math.random() < CONFIG.backScrollChance) {
+        const backAmount = randInt(CONFIG.backScrollMin, CONFIG.backScrollMax);
+        window.scrollBy(0, -backAmount);
+        console.log(`[stealth] 回翻 ${backAmount}px`);
+        scheduleNextScroll();
+        return;
+      }
+
+      // 正常向下滚动
+      window.scrollBy(0, clampedStep);
+
+      // 检查是否到底
+      if (isNearBottom()) {
+        onReachedBottom();
+        return;
+      }
+
+      scheduleNextScroll();
+    }, clampedInterval);
+  }
+
+  function stopScrolling() {
+    if (scrollTimer !== null) {
+      clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+    if (readingTimer !== null) {
+      clearTimeout(readingTimer);
+      readingTimer = null;
+    }
+  }
+
+  // ============= 到达底部后的处理 =============
+
+  function onReachedBottom() {
+    stopScrolling();
+    console.log("[stealth] 到达底部");
+
+    // 尝试点赞（在到底之后，概率判断）
+    maybeAutoLike();
+
+    // 检查是否达到每日话题上限
+    const newCount = incrementTopicCount();
+    if (newCount >= CONFIG.dailyTopicLimit) {
+      console.log("[stealth] 已达到今日话题上限，停止阅读");
+      localStorage.setItem("read", "false");
+      return;
+    }
+
+    // 等待一段时间后跳转到下一个话题
+    const gap = randInt(CONFIG.topicGapMin, CONFIG.topicGapMax);
+    console.log(`[stealth] ${(gap / 1000).toFixed(1)}s 后跳转下一个话题`);
+    setTimeout(() => {
+      navigateToNextTopic();
+    }, gap);
+  }
+
+  // ============= 话题导航 =============
+
+  async function fetchTopicList() {
+    // 随机选一个列表源
+    const sources = [
+      `${BASE_URL}/latest.json?no_definitions=true&page=0`,
+      `${BASE_URL}/latest.json?no_definitions=true&page=1`,
+      `${BASE_URL}/top.json?period=weekly`,
+    ];
+    const sourceUrl = sources[randInt(0, sources.length - 1)];
+
+    try {
+      const response = await fetch(sourceUrl, {
+        headers: { "Accept": "application/json" },
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+
+      if (data && data.topic_list && data.topic_list.topics) {
+        // 过滤掉评论过多的话题（可能是超长讨论帖）
+        return data.topic_list.topics.filter(
+          (t) => t.posts_count > 2 && t.posts_count < 500
+        );
+      }
+    } catch (err) {
+      console.error("[stealth] 获取话题列表失败:", err.message);
+    }
+    return [];
+  }
+
+  async function navigateToNextTopic() {
+    if (localStorage.getItem("read") !== "true") return;
+
+    const topics = await fetchTopicList();
+    if (topics.length === 0) {
+      console.log("[stealth] 未获取到话题，停止");
+      localStorage.setItem("read", "false");
+      return;
+    }
+
+    // 随机选一个话题（不是按顺序）
+    const topic = topics[randInt(0, Math.min(topics.length - 1, CONFIG.topicListPageSize - 1))];
+    const url = topic.last_read_post_number
+      ? `${BASE_URL}/t/topic/${topic.id}/${topic.last_read_post_number}`
+      : `${BASE_URL}/t/topic/${topic.id}`;
+
+    console.log(`[stealth] 跳转话题: ${topic.id} (${topic.title?.slice(0, 30)}...)`);
+    window.location.href = url;
+  }
+
+  // ============= 自动阅读（每个话题的定时器） =============
+
+  function startReadingTopic() {
+    // 计算这个话题要读多久
+    const readTime = randInt(CONFIG.minReadTime, CONFIG.maxReadTime);
+    console.log(`[stealth] 本话题阅读时间: ${(readTime / 1000).toFixed(0)}s`);
+
+    // 开始人类模拟滚动
+    startHumanScroll();
+
+    // 设置最大阅读时间，到时间了即使没滚到底也跳走
+    readingTimer = setTimeout(() => {
+      if (localStorage.getItem("read") === "true") {
+        console.log("[stealth] 阅读时间到，跳转下一个话题");
+        stopScrolling();
+        maybeAutoLike();
+        const newCount = incrementTopicCount();
+        if (newCount >= CONFIG.dailyTopicLimit) {
+          console.log("[stealth] 已达到今日话题上限，停止阅读");
+          localStorage.setItem("read", "false");
+          return;
+        }
+        const gap = randInt(CONFIG.topicGapMin, CONFIG.topicGapMax);
+        setTimeout(() => navigateToNextTopic(), gap);
+      }
+    }, readTime);
+  }
+
+  // ============= 自动点赞（隐蔽版） =============
+
+  function maybeAutoLike() {
+    if (localStorage.getItem("autoLikeEnabled") === "false") return;
+    if (hasReachedLikeLimit()) return;
+
+    // 只有滚动超过一定比例才考虑
+    const progress = getScrollProgress();
+    if (progress < CONFIG.likeMinScrollRatio) return;
+
+    // 概率判定
+    if (Math.random() > CONFIG.likeChance) return;
+
+    // 找到能点赞的按钮
+    const buttons = document.querySelectorAll(".discourse-reactions-reaction-button");
+    if (buttons.length === 0) return;
+
+    // 随机选一个可点赞的按钮（靠近当前可视区域的）
+    const viewportCenter = window.scrollY + window.innerHeight / 2;
+    const nearbyButtons = Array.from(buttons).filter((btn) => {
+      if (btn.title !== "点赞此帖子" && btn.title !== "Like this post") return false;
+      const rect = btn.getBoundingClientRect();
+      const absY = rect.top + window.scrollY;
+      // 只选在当前视口上下 500px 范围内的
+      return Math.abs(absY - viewportCenter) < 500;
+    });
+
+    if (nearbyButtons.length === 0) return;
+
+    const targetBtn = nearbyButtons[randInt(0, nearbyButtons.length - 1)];
+
+    // 延迟点赞（模拟思考时间）
+    const likeDelay = randInt(800, 3000);
+    setTimeout(() => {
+      const event = new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      });
+      targetBtn.dispatchEvent(event);
+      incrementLikeCount();
+      console.log("[stealth] 已点赞");
+    }, likeDelay);
+  }
+
+  // ============= 初始化 =============
+
   function checkFirstRun() {
     if (localStorage.getItem("isFirstRun") === null) {
-      console.log("脚本第一次运行，执行初始化操作...");
-      updateInitialData();
+      console.log("[stealth] 首次运行，初始化设置");
+      localStorage.setItem("read", "false");
+      localStorage.setItem("autoLikeEnabled", "false");
       localStorage.setItem("isFirstRun", "false");
-    } else {
-      console.log("脚本非第一次运行");
     }
   }
 
-  // 更新初始数据的函数
-  function updateInitialData() {
-    localStorage.setItem("read", "false"); // 开始时自动滚动关闭
-    localStorage.setItem("autoLikeEnabled", "false"); //默认关闭自动点赞
-    console.log("执行了初始数据更新操作");
-  }
-  const delay = 2000; // 滚动检查的间隔（毫秒）
-  let scrollInterval = null;
-  let checkScrollTimeout = null;
-  let autoLikeInterval = null;
+  // ============= 入口 =============
 
-  function scrollToBottomSlowly(distancePerStep = 20, delayPerStep = 50) {
-    if (scrollInterval !== null) {
-      clearInterval(scrollInterval);
-    }
-    scrollInterval = setInterval(() => {
-      window.scrollBy(0, distancePerStep);
-    }, delayPerStep); // 每50毫秒滚动20像素
-  }
-
-  function getLatestTopic() {
-    let latestPage = Number(localStorage.getItem("latestPage")) || 0;
-    let topicList = [];
-    let isDataSufficient = false;
-
-    while (!isDataSufficient) {
-      latestPage++;
-      const url = `${BASE_URL}/latest.json?no_definitions=true&page=${latestPage}`;
-
-      $.ajax({
-        url: url,
-        async: false,
-        success: function (result) {
-          if (
-            result &&
-            result.topic_list &&
-            result.topic_list.topics.length > 0
-          ) {
-            result.topic_list.topics.forEach((topic) => {
-              // 未读且评论数小于 commentLimit
-              if (commentLimit > topic.posts_count) {
-                //其实不需要 !topic.unseen &&
-                topicList.push(topic);
-              }
-            });
-
-            // 检查是否已获得足够的 topics
-            if (topicList.length >= topicListLimit) {
-              isDataSufficient = true;
-            }
-          } else {
-            isDataSufficient = true; // 没有更多内容时停止请求
-          }
-        },
-        error: function (XMLHttpRequest, textStatus, errorThrown) {
-          console.error(XMLHttpRequest, textStatus, errorThrown);
-          isDataSufficient = true; // 遇到错误时也停止请求
-        },
-      });
-    }
-
-    if (topicList.length > topicListLimit) {
-      topicList = topicList.slice(0, topicListLimit);
-    }
-
-    // 其实不需要对latestPage操作
-    // localStorage.setItem("latestPage", latestPage);
-    localStorage.setItem("topicList", JSON.stringify(topicList));
-  }
-
-  function openNewTopic() {
-    let topicListStr = localStorage.getItem("topicList");
-    let topicList = topicListStr ? JSON.parse(topicListStr) : [];
-
-    // 如果列表为空，则获取最新文章
-    if (topicList.length === 0) {
-      getLatestTopic();
-      topicListStr = localStorage.getItem("topicList");
-      topicList = topicListStr ? JSON.parse(topicListStr) : [];
-    }
-
-    // 如果获取到新文章，打开第一个
-    if (topicList.length > 0) {
-      const topic = topicList.shift();
-      localStorage.setItem("topicList", JSON.stringify(topicList));
-      if (topic.last_read_post_number) {
-        window.location.href = `${BASE_URL}/t/topic/${topic.id}/${topic.last_read_post_number}`;
-      } else {
-        window.location.href = `${BASE_URL}/t/topic/${topic.id}`;
-      }
-    }
-  }
-
-  // 检查是否已滚动到底部(不断重复执行),到底部时跳转到下一个话题
-  function checkScroll() {
-    if (localStorage.getItem("read")) {
-      if (
-        window.innerHeight + window.scrollY >=
-        document.body.offsetHeight - 100
-      ) {
-        console.log("已滚动到底部");
-        openNewTopic();
-      } else {
-        scrollToBottomSlowly();
-        if (checkScrollTimeout !== null) {
-          clearTimeout(checkScrollTimeout);
-        }
-        checkScrollTimeout = setTimeout(checkScroll, delay);
-      }
-    }
-  }
-
-  // 入口函数
   window.addEventListener("load", () => {
     checkFirstRun();
-    console.log(
-      "autoRead",
-      localStorage.getItem("read"),
-      "autoLikeEnabled",
-      localStorage.getItem("autoLikeEnabled")
-    );
-    if (localStorage.getItem("read") === "true") {
-      console.log("执行正常的滚动和检查逻辑");
-      checkScroll();
-      if (isAutoLikeEnabled()) {
-        autoLike();
+
+    const isReading = localStorage.getItem("read") === "true";
+    const isAutoLike = localStorage.getItem("autoLikeEnabled") !== "false";
+
+    console.log(`[stealth] read=${isReading}, autoLike=${isAutoLike}`);
+    console.log(`[stealth] 配额: 话题 ${CONFIG.dailyTopicLimit}/天, 点赞 ${CONFIG.dailyLikeLimit}/天`);
+
+    const stats = getDailyStats();
+    console.log(`[stealth] 今日已完成: 话题 ${stats.topicsToday}, 点赞 ${stats.likesToday}`);
+
+    if (isReading) {
+      // 检查是否已达到今日上限
+      if (hasReachedTopicLimit()) {
+        console.log("[stealth] 今日话题上限已达到，不继续阅读");
+        localStorage.setItem("read", "false");
+        return;
+      }
+
+      // 判断当前页面是话题页还是列表页
+      const isTopicPage = /\/t\/[^/]+\/\d+/.test(window.location.pathname);
+      if (isTopicPage) {
+        // 在话题页 → 开始阅读
+        const initialDelay = randInt(1000, 3000);
+        setTimeout(() => startReadingTopic(), initialDelay);
+      } else {
+        // 在列表页 → 随机点一个话题进入
+        const initialDelay = randInt(2000, 5000);
+        setTimeout(() => {
+          // 先随机滚动一下列表页
+          const scrollDist = randInt(200, 800);
+          window.scrollBy(0, scrollDist);
+          setTimeout(() => {
+            navigateToNextTopic();
+          }, randInt(1000, 3000));
+        }, initialDelay);
       }
     }
   });
 
-  // 获取当前时间戳
-  const currentTime = Date.now();
-  // 获取存储的时间戳
-  const defaultTimestamp = new Date("1999-01-01T00:00:00Z").getTime(); //默认值为1999年
-  const storedTime = parseInt(
-    localStorage.getItem("clickCounterTimestamp") ||
-      defaultTimestamp.toString(),
-    10
-  );
+  // ============= UI 控制按钮 =============
 
-  // 获取当前的点击计数，如果不存在则初始化为0
-  let clickCounter = parseInt(localStorage.getItem("clickCounter") || "0", 10);
-  // 检查是否超过24小时（24小时 = 24 * 60 * 60 * 1000 毫秒）
-  if (currentTime - storedTime > 24 * 60 * 60 * 1000) {
-    // 超过24小时，清空点击计数器并更新时间戳
-    clickCounter = 0;
-    localStorage.setItem("clickCounter", "0");
-    localStorage.setItem("clickCounterTimestamp", currentTime.toString());
-  }
-
-  console.log(`Initial clickCounter: ${clickCounter}`);
-  function triggerClick(button) {
-    const event = new MouseEvent("click", {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-    });
-    button.dispatchEvent(event);
-  }
-
-  function autoLike() {
-    console.log(`Initial clickCounter: ${clickCounter}`);
-    // 寻找所有的discourse-reactions-reaction-button
-    const buttons = document.querySelectorAll(
-      ".discourse-reactions-reaction-button"
-    );
-    if (buttons.length === 0) {
-      console.error(
-        "No buttons found with the selector '.discourse-reactions-reaction-button'"
-      );
-      return;
-    }
-    console.log(`Found ${buttons.length} buttons.`); // 调试信息
-
-    // 逐个点击找到的按钮
-    buttons.forEach((button, index) => {
-      if (
-        (button.title !== "点赞此帖子" && button.title !== "Like this post") ||
-        clickCounter >= likeLimit
-      ) {
-        return;
-      }
-
-      // 新增：点赞前加一个随机概率判断（如30%概率）
-      const likeProbability = 0.3; // 0~1之间，0.3表示30%概率
-      if (Math.random() > likeProbability) {
-        console.log(`跳过第${index + 1}个按钮（未通过概率判断）`);
-        return;
-      }
-
-      // 点赞间隔时间也随机（2~5秒之间）
-      const randomDelay = 2000 + Math.floor(Math.random() * 3000);
-
-      autoLikeInterval = setTimeout(() => {
-        // 模拟点击
-        triggerClick(button); // 使用自定义的触发点击方法
-        console.log(`Clicked like button ${index + 1}`);
-        clickCounter++; // 更新点击计数器
-        // 将新的点击计数存储到localStorage
-        localStorage.setItem("clickCounter", clickCounter.toString());
-        // 如果点击次数达到likeLimit次，则设置点赞变量为false
-        if (clickCounter === likeLimit) {
-          console.log(
-            `Reached ${likeLimit} likes, setting the like variable to false.`
-          );
-          localStorage.setItem("autoLikeEnabled", "false"); // 使用localStorage存储点赞变量状态
-        } else {
-          console.log("clickCounter:", clickCounter);
-        }
-      }, index * randomDelay); // 每次点赞的延迟为随机值
-    });
-  }
   const button = document.createElement("button");
-  // 初始化按钮文本基于当前的阅读状态
   button.textContent =
     localStorage.getItem("read") === "true" ? "停止阅读" : "开始阅读";
-  button.style.position = "fixed";
-  button.style.bottom = "10px"; // 之前是 top
-  button.style.left = "10px"; // 之前是 right
-  button.style.zIndex = 1000;
-  button.style.backgroundColor = "#f0f0f0"; // 浅灰色背景
-  button.style.color = "#000"; // 黑色文本
-  button.style.border = "1px solid #ddd"; // 浅灰色边框
-  button.style.padding = "5px 10px"; // 内边距
-  button.style.borderRadius = "5px"; // 圆角
+  button.style.cssText = `
+    position: fixed; bottom: 10px; left: 10px; z-index: 1000;
+    background-color: #f0f0f0; color: #000; border: 1px solid #ddd;
+    padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  `;
   document.body.appendChild(button);
 
   button.onclick = function () {
@@ -290,60 +457,30 @@
     const newReadState = !currentlyReading;
     localStorage.setItem("read", newReadState.toString());
     button.textContent = newReadState ? "停止阅读" : "开始阅读";
+
     if (!newReadState) {
-      if (scrollInterval !== null) {
-        clearInterval(scrollInterval);
-        scrollInterval = null;
-      }
-      if (checkScrollTimeout !== null) {
-        clearTimeout(checkScrollTimeout);
-        checkScrollTimeout = null;
-      }
-      localStorage.removeItem("navigatingToNextTopic");
+      stopScrolling();
     } else {
-      // 如果是Linuxdo，就导航到我的帖子
-      if (BASE_URL == "https://linux.do") {
-        window.location.href = "https://linux.do/t/topic/13716/900";
-      } else {
-        window.location.href = `${BASE_URL}/t/topic/1`;
-      }
-      checkScroll();
+      // 开始阅读：跳转到最新页面
+      window.location.href = `${BASE_URL}/latest`;
     }
   };
 
-  //自动点赞按钮
-  // 在页面上添加一个控制自动点赞的按钮
+  // 自动点赞按钮
   const toggleAutoLikeButton = document.createElement("button");
-  toggleAutoLikeButton.textContent = isAutoLikeEnabled()
-    ? "禁用自动点赞"
-    : "启用自动点赞";
-  toggleAutoLikeButton.style.position = "fixed";
-  toggleAutoLikeButton.style.bottom = "50px"; // 之前是 top，且与另一个按钮错开位置
-  toggleAutoLikeButton.style.left = "10px"; // 之前是 right
-  toggleAutoLikeButton.style.zIndex = "1000";
-  toggleAutoLikeButton.style.backgroundColor = "#f0f0f0"; // 浅灰色背景
-  toggleAutoLikeButton.style.color = "#000"; // 黑色文本
-  toggleAutoLikeButton.style.border = "1px solid #ddd"; // 浅灰色边框
-  toggleAutoLikeButton.style.padding = "5px 10px"; // 内边距
-  toggleAutoLikeButton.style.borderRadius = "5px"; // 圆角
+  const isAutoLikeOn = localStorage.getItem("autoLikeEnabled") !== "false";
+  toggleAutoLikeButton.textContent = isAutoLikeOn ? "禁用自动点赞" : "启用自动点赞";
+  toggleAutoLikeButton.style.cssText = `
+    position: fixed; bottom: 50px; left: 10px; z-index: 1000;
+    background-color: #f0f0f0; color: #000; border: 1px solid #ddd;
+    padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  `;
   document.body.appendChild(toggleAutoLikeButton);
 
-  // 为按钮添加点击事件处理函数
   toggleAutoLikeButton.addEventListener("click", () => {
-    const isEnabled = !isAutoLikeEnabled();
-    setAutoLikeEnabled(isEnabled);
-    toggleAutoLikeButton.textContent = isEnabled
-      ? "禁用自动点赞"
-      : "启用自动点赞";
+    const currentEnabled = localStorage.getItem("autoLikeEnabled") !== "false";
+    const newEnabled = !currentEnabled;
+    localStorage.setItem("autoLikeEnabled", newEnabled ? "true" : "false");
+    toggleAutoLikeButton.textContent = newEnabled ? "禁用自动点赞" : "启用自动点赞";
   });
-  // 判断是否启用自动点赞
-  function isAutoLikeEnabled() {
-    // 从localStorage获取autoLikeEnabled的值，如果未设置，默认为"true"
-    return localStorage.getItem("autoLikeEnabled") !== "false";
-  }
-
-  // 设置自动点赞的启用状态
-  function setAutoLikeEnabled(enabled) {
-    localStorage.setItem("autoLikeEnabled", enabled ? "true" : "false");
-  }
 })();
